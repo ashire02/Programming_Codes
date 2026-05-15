@@ -1,104 +1,60 @@
 # NDVI Analysis — Nepal (Google Earth Engine)
 
-Interactive NDVI mapping over Nepal using **Landsat 5 / 8 / 9** Surface Reflectance imagery, built with a fully interactive side-panel UI inside Google Earth Engine.
+Year-by-year NDVI mapping over Nepal using **Landsat 5 / 8 / 9** Surface Reflectance.  
+Plain side-panel UI with Prev/Next year navigation.
 
 ---
 
-## Landsat Sensor Coverage
+## Sensor Coverage
 
-| Sensor | Collection | Red band | NIR band | Available in script |
+| Sensor | Collection | Red | NIR | Period used |
 |---|---|---|---|---|
-| **Landsat 5 TM** | `LANDSAT/LT05/C02/T1_L2` | SR_B3 | SR_B4 | 1990 – May 2013 |
-| **Landsat 8 OLI** | `LANDSAT/LC08/C02/T1_L2` | SR_B4 | SR_B5 | Apr 2013 – present |
-| **Landsat 9 OLI-2** | `LANDSAT/LC09/C02/T1_L2` | SR_B4 | SR_B5 | Oct 2022 – present |
+| Landsat 5 TM | `LANDSAT/LT05/C02/T1_L2` | SR_B3 | SR_B4 | 1990 – May 2013 |
+| Landsat 8 OLI | `LANDSAT/LC08/C02/T1_L2` | SR_B4 | SR_B5 | Apr 2013 – present |
+| Landsat 9 OLI-2 | `LANDSAT/LC09/C02/T1_L2` | SR_B4 | SR_B5 | Oct 2022 – present |
 
-**Sensor selection is automatic** based on the year range you choose in the panel:
-- Years ≤ 2013 → Landsat 5 included
-- Years ≥ 2013 → Landsat 8 included
-- Years ≥ 2022 → Landsat 9 included (from Oct 2022, one year after its Sep 2021 launch)
-
-During overlap periods (e.g. Apr–May 2013, Oct 2022 onwards), multiple sensors are merged automatically.
+Sensor selection is automatic based on the chosen year. Overlap years merge all valid sensors.
 
 ---
 
-## Side-Panel UI Controls
+## Panel Controls
 
-| Widget | Description |
+| Control | Description |
 |---|---|
-| **Start / End Year** | Dropdowns, 1990 – 2025 |
+| **◀ Prev / Next ▶** | Step one year back or forward |
+| **Year slider** | Jump directly to any year 1990–2025 |
 | **Season** | Annual, Dry/Winter, Pre-Monsoon, Monsoon, Post-Monsoon |
-| **Max Cloud Cover** | Slider (5 – 80 %) |
-| **Composite Method** | Median (default), Mean, Max (greenest pixel) |
+| **Max Cloud Cover** | Slider 5–80 % |
+| **Composite Method** | Median / Mean / Max (greenest pixel) |
 | **Display Layer** | Continuous NDVI, Classified NDVI, or Both |
-| **Active Sensors** | Auto-updated on Run — shows which sensors are active |
-| **▶ Run Analysis** | Builds collection, composites, adds map layers |
-| **NDVI Statistics** | Mean / Min / Max / StdDev computed at 500 m (async, non-blocking) |
-| **Export to Drive** | Submits a 30 m export task for continuous or classified NDVI |
+| **▶ Run** | Build and show the selected year's NDVI |
+| **NDVI Statistics** | Mean, Min, Max, StdDev (async, non-blocking) |
+| **⬇ Export** | Save 30 m GeoTIFF to Google Drive (`GEE_Exports/`) |
 
 ---
 
-## NDVI Classification Scheme
+## NDVI Classification
 
-| Class | NDVI Range | Land Cover | Colour |
-|---|---|---|---|
-| 1 | < 0.0 | Water / Snow / Non-vegetated | Blue |
-| 2 | 0.0 – 0.1 | Bare soil / Built-up | Red |
-| 3 | 0.1 – 0.2 | Very sparse vegetation | Orange |
-| 4 | 0.2 – 0.4 | Moderate vegetation (shrubs, grassland) | Light yellow-green |
-| 5 | 0.4 – 0.6 | Dense vegetation (forest, cropland) | Green |
-| 6 | > 0.6 | Very dense / Healthy forest | Dark green |
-
----
-
-## Season Windows
-
-| Season option | Months |
-|---|---|
-| Annual (Jan–Dec) | Full calendar year |
-| Dry/Winter (Oct–Apr) | Post-monsoon + winter |
-| Pre-Monsoon (Mar–May) | Spring dry season |
-| Monsoon (Jun–Sep) | South Asian monsoon |
-| Post-Monsoon (Oct–Nov) | Harvest season |
+| Class | Range | Cover type |
+|---|---|---|
+| 1 | < 0.0 | Water / Snow |
+| 2 | 0.0 – 0.1 | Bare soil / Built-up |
+| 3 | 0.1 – 0.2 | Very sparse vegetation |
+| 4 | 0.2 – 0.4 | Moderate vegetation |
+| 5 | 0.4 – 0.6 | Dense vegetation |
+| 6 | > 0.6 | Very dense / Healthy forest |
 
 ---
 
 ## How to Run
 
-1. Open [Google Earth Engine Code Editor](https://code.earthengine.google.com/)
-2. Create a new script and paste the full contents of [`ndvi_nepal_landsat.js`](./ndvi_nepal_landsat.js)
-3. Click **Run** — the editor loads the split-panel UI
-4. Set your year range, season, and options in the left panel
-5. Click **▶ Run Analysis**
-
-The map centres on Nepal. Statistics appear below the button once computed (async — the map does not wait for them).
-
----
-
-## Why the Side Panel Prevents Browser Freezing
-
-GEE's default script runs all `Map.addLayer` calls synchronously on page load. This script defers all computation until the **Run** button is clicked, and uses:
-- `image.evaluate()` (async callback) for statistics — never blocks the UI thread
-- Scale 500 m for stats (fast preview), 30 m only on export
-- `bestEffort: true` to avoid quota timeouts
-- `mapPanel.layers().reset()` to clear old layers cleanly before adding new ones
-
----
-
-## Export
-
-Click **⬇ Export to Drive** after running an analysis. The task appears in the **Tasks** tab (top-right corner of the Code Editor). Files are saved to your Google Drive under the folder `GEE_Exports` at 30 m resolution, EPSG:4326.
+1. Open [code.earthengine.google.com](https://code.earthengine.google.com/)
+2. Paste `ndvi_nepal_landsat.js` into the Code Editor
+3. Click **Run** — the split-panel loads
+4. Pick a year, season, and options, then click **▶ Run**
 
 ---
 
 ## Asset
 
-AOI shapefile: `projects/ashire02/assets/Nepal`
-
----
-
-## References
-
-- Rouse et al. (1974) — NDVI formulation
-- USGS Landsat Collection 2 Surface Reflectance product guide
-- [GEE Landsat catalog](https://developers.google.com/earth-engine/datasets/catalog/landsat)
-- Landsat 9 launch & operations — USGS/NASA (Sep 2021 launch, Feb 2022 science ops)
+`projects/ashire02/assets/Nepal`

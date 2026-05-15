@@ -391,10 +391,17 @@ runBtn.onClick(function() {
 exportBtn.onClick(function() {
   if (!currentNDVI) { exportLbl.setValue('Run first.'); return; }
   var choice = exportSel.getValue();
-  var img    = (choice === 'Classified NDVI') ? currentClassified : currentNDVI;
   var tag    = (choice === 'Classified NDVI') ? 'Classified' : 'Continuous';
   var desc   = 'Nepal_NDVI_' + tag + '_' + currentYear + '_' +
                currentSeason.replace(/[^a-zA-Z0-9]/g, '_');
+
+  var img;
+  if (choice === 'Classified NDVI') {
+    // Export as RGB — colors are baked in, opens correctly in QGIS/ArcGIS without any extra steps
+    img = currentClassified.visualize({min: 1, max: 6, palette: CLASS_COLORS});
+  } else {
+    img = currentNDVI;
+  }
 
   Export.image.toDrive({
     image         : img,

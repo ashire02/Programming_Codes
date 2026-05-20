@@ -58,18 +58,57 @@ print(f"Output directory : {OUTPUT_DIR}")
 
 print("\n[1/5] Loading HRU shapefile ...")
 hru_gdf = gpd.read_file(HRU_SHAPEFILE)
-print(f"      Polygons  : {len(hru_gdf)}")
-print(f"      Columns   : {list(hru_gdf.columns)}")
+n_polys = len(hru_gdf)
+print(f"      Polygons  : {n_polys}")
 print(f"      CRS       : {hru_gdf.crs}")
 
-# Auto-detect HRU ID field if not specified
+# Print all columns with types, unique counts, and sample values so the user
+# can verify which column holds the HRU numbers.
+non_geom_cols = [c for c in hru_gdf.columns if c.lower() != "geometry"]
+print(f"\n      {'Column':<20} {'dtype':<12} {'unique':>6}  {'sample values'}")
+print(f"      {'-'*20} {'-'*12} {'-'*6}  {'-'*30}")
+for col in non_geom_cols:
+    uvals  = hru_gdf[col].nunique()
+    sample = hru_gdf[col].dropna().unique()[:4].tolist()
+    print(f"      {col:<20} {str(hru_gdf[col].dtype):<12} {uvals:>6}  {sample}")
+
+# Auto-detect HRU ID field if not specified.
+# Strategy: find the integer-type column whose unique-value count is the
+# smallest among those that are (a) numeric and (b) have more than 1 unique
+# value and (c) have values that look like small positive integers (HRU IDs).
 if HRU_ID_FIELD is None:
-    non_geom = [c for c in hru_gdf.columns if c.lower() != "geometry"]
-    keywords = ["hru", "hruid", "hru_id", "subbasin", "basin", "id"]
-    detected = [c for c in non_geom if any(k in c.lower() for k in keywords)]
-    HRU_ID_FIELD = detected[0] if detected else non_geom[0]
-    print(f"\n      HRU ID field auto-detected as : '{HRU_ID_FIELD}'")
-    print(f"      (Change HRU_ID_FIELD at the top if this is wrong.)")
+    candidates = []
+    for col in non_geom_cols:
+        ser = hru_gdf[col]
+        ucount = ser.nunique()
+        if ucount < 2:
+            continue
+        # Try to coerce to numeric
+        num = pd.to_numeric(ser, errors="coerce")
+        frac_numeric = num.notna().mean()
+        if frac_numeric < 0.9:
+            continue
+        # Values should look like small positive integers
+        vals = num.dropna()
+        if vals.min() < 0 or vals.max() > 10_000:
+            continue
+        # Prefer columns where unique count << n_polys (groups exist)
+        candidates.append((col, ucount, frac_numeric))
+
+    if candidates:
+        # Pick column with fewest unique values (most "grouped") that is
+        # also closest to what we expect (ucount <= n_polys)
+        candidates.sort(key=lambda x: x[1])
+        HRU_ID_FIELD = candidates[0][0]
+    else:
+        # Last resort: use first non-geometry column
+        HRU_ID_FIELD = non_geom_cols[0]
+
+    print(f"\n      >>> HRU ID field selected : '{HRU_ID_FIELD}'")
+    print(f"          Unique HRU IDs found  : {hru_gdf[HRU_ID_FIELD].nunique()}")
+    print(f"          Set HRU_ID_FIELD at the top if this looks wrong.")
+else:
+    print(f"\n      HRU ID field (user-set) : '{HRU_ID_FIELD}'")
 
 print("\n[1/5] Loading DEM ...")
 with rasterio.open(DEM_RASTER) as src:
@@ -106,7 +145,12 @@ if hru_gdf.crs != dem_crs:
 # Determine representative cell size in metres
 if dem_crs.is_geographic:
     # Degrees → metres: 1° ≈ 111 320 m, adjusted for latitude
-    centroid_lat = float(hru_gdf.geometry.union_all().centroid.y)
+    # union_all() is geopandas ≥0.14; unary_union works on all versions
+    try:
+        combined = hru_gdf.geometry.union_all()
+    except AttributeError:
+        combined = hru_gdf.geometry.unary_union
+    centroid_lat = float(combined.centroid.y)
     cell_size_m  = cell_w * 111_320.0 * abs(np.cos(np.radians(centroid_lat)))
     print(f"      Geographic CRS  →  estimated cell size = {cell_size_m:.2f} m "
           f"(at lat {centroid_lat:.3f}°)")
@@ -354,12 +398,15 @@ def _weighted_mean_group(group: pd.DataFrame) -> pd.Series:
     )
 
 
-df_out = (
-    df_raw
-    .groupby("HRU_ID", sort=False)
-    .apply(_weighted_mean_group)
-    .reset_index()
-)
+try:
+    df_out = (df_raw.groupby("HRU_ID", sort=False)
+              .apply(_weighted_mean_group, include_groups=False)
+              .reset_index())
+except TypeError:
+    # pandas < 2.2 does not have include_groups
+    df_out = (df_raw.groupby("HRU_ID", sort=False)
+              .apply(_weighted_mean_group)
+              .reset_index())
 
 
 # -----------------------------------------------------------------------------

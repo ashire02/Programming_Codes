@@ -55,6 +55,9 @@ OUTPUT_CSV    = os.path.join(OUTPUT_DIR, "hru_routing_lengths.csv")
 # Exact column name holding HRU IDs (set to None to auto-detect)
 HRU_ID_FIELD  = "h_r_u"
 
+# Set to an HRU ID to print detailed diagnostics for that HRU (None = off)
+DEBUG_HRU     = 35
+
 
 # =============================================================================
 # STEP 1 — LOAD DATA
@@ -496,6 +499,83 @@ for i, (_, row) in enumerate(hru_gdf.iterrows()):
         )
 
     rl = _routing_length(hru_mask, fdir_full)
+
+    # ── Optional per-HRU diagnostics ──────────────────────────────────────
+    if DEBUG_HRU is not None and str(hru_id) == str(DEBUG_HRU):
+        r_dbg, c_dbg = np.where(hru_mask)
+        pad   = 1
+        rmin_d = max(0, int(r_dbg.min()) - pad)
+        rmax_d = min(fdir_full.shape[0], int(r_dbg.max()) + pad + 1)
+        cmin_d = max(0, int(c_dbg.min()) - pad)
+        cmax_d = min(fdir_full.shape[1], int(c_dbg.max()) + pad + 1)
+        mask_d = hru_mask[rmin_d:rmax_d, cmin_d:cmax_d]
+        fdir_d = fdir_full[rmin_d:rmax_d, cmin_d:cmax_d]
+        rl_d   = r_dbg - rmin_d
+        cl_d   = c_dbg - cmin_d
+        MR_d, MC_d = mask_d.shape
+
+        facc_d = _local_flow_accumulation(fdir_d, mask_d)
+        facc_g = facc_full[rmin_d:rmax_d, cmin_d:cmax_d]
+
+        # Collect all exit cells
+        exits = []
+        for r, c in zip(rl_d, cl_d):
+            d = int(fdir_d[r, c])
+            if d not in D8:
+                exits.append((r+rmin_d, c+cmin_d, facc_d[r,c], facc_g[r,c], "no_d8"))
+                continue
+            dr, dc, dist = D8[d]
+            r2, c2 = r+dr, c+dc
+            if r2<0 or r2>=MR_d or c2<0 or c2>=MC_d or not mask_d[r2,c2]:
+                exits.append((r+rmin_d, c+cmin_d, facc_d[r,c], facc_g[r,c], d))
+        exits.sort(key=lambda x: -x[2])
+
+        # Path-length array (same logic as _routing_length)
+        path_len_d = np.full((MR_d, MC_d), np.nan)
+        if exits:
+            best = exits[0]
+            d = best[4]
+            if d in D8:
+                path_len_d[best[0]-rmin_d, best[1]-cmin_d] = D8[d][2]
+        order_d = np.argsort(-facc_d[rl_d, cl_d])
+        for r, c in zip(rl_d[order_d], cl_d[order_d]):
+            if not np.isnan(path_len_d[r, c]):
+                continue
+            d = int(fdir_d[r, c])
+            if d not in D8:
+                continue
+            dr, dc, dist = D8[d]
+            r2, c2 = r+dr, c+dc
+            exits_hru = (r2<0 or r2>=MR_d or c2<0 or c2>=MC_d or not mask_d[r2,c2])
+            if not exits_hru and not np.isnan(path_len_d[r2, c2]):
+                path_len_d[r, c] = dist + path_len_d[r2, c2]
+
+        path_vals = path_len_d[rl_d, cl_d]
+        connected = int(np.sum(~np.isnan(path_vals)))
+
+        print(f"\n{'='*60}")
+        print(f"  DEBUG  HRU {DEBUG_HRU}")
+        print(f"{'='*60}")
+        print(f"  Total cells       : {n_cells}")
+        print(f"  HRU extent        : rows {r_dbg.min()}-{r_dbg.max()} "
+              f"({r_dbg.max()-r_dbg.min()+1} rows), "
+              f"cols {c_dbg.min()}-{c_dbg.max()} "
+              f"({c_dbg.max()-c_dbg.min()+1} cols)")
+        print(f"  Elevation         : {elev_min:.0f} – {elev_max:.0f} m "
+              f"(range {elev_range:.0f} m)")
+        print(f"  D8 flat cells     : "
+              f"{int(((fdir_d==0) & mask_d).sum())} of {n_cells}")
+        print(f"  Exit cells        : {len(exits)}")
+        print(f"  Max local acc     : {facc_d[mask_d].max():.0f} "
+              f"(= {facc_d[mask_d].max()/n_cells*100:.0f}% of cells)")
+        print(f"  Cells → main outlet: {connected} of {n_cells} "
+              f"({connected/n_cells*100:.0f}%)")
+        print(f"  Routing length    : {rl:.2f} m")
+        print(f"\n  Top-10 exit cells (local_acc → more = bigger catchment inside HRU):")
+        print(f"  {'row':>5} {'col':>5}  {'loc_acc':>8}  {'glob_acc':>10}  {'d8':>4}")
+        for ex in exits[:10]:
+            print(f"  {ex[0]:>5} {ex[1]:>5}  {ex[2]:>8.0f}  {ex[3]:>10.0f}  {ex[4]:>4}")
+        print(f"{'='*60}\n")
 
     records.append({
         "HRU_ID":           hru_id,

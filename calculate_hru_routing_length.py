@@ -262,25 +262,80 @@ print(f"      Done.  Max accumulation: {facc_full.max():,.0f} cells")
 print(f"\n[5/6] Computing routing lengths for {n_polys} HRUs ...")
 
 
-def _routing_length(hru_mask, fdir_arr, facc_arr):
+def _local_flow_accumulation(fdir, mask):
     """
-    Longest D8 flow path (metres) within the HRU.
+    Flow accumulation computed ONLY within the HRU cells.
 
-    1. OVERLAY  : Extract only cells inside the HRU polygon.
-    2. OUTLET   : Find the main outlet = HRU boundary cell (D8 exits polygon)
-                  with the highest flow accumulation.
-    3. PATH LEN : For each cell, trace D8 downstream within the HRU.
-                  Record path length only if it reaches the main outlet.
-    4. RESULT   : Maximum recorded path length
-                  = distance from the watershed divide to the outlet.
+    Every HRU cell starts with value 1. Flow is only passed to neighbours
+    that are also inside the HRU. Cells whose D8 exits the HRU keep their
+    accumulated value but do not pass it further.
 
-    Falls back to max-path-to-any-exit if no cell drains to the main outlet.
+    Result: high value = near the HRU outlet (many cells drain through it)
+            value = 1  = at the divide (no upstream HRU cells feed it)
+
+    WHY LOCAL, NOT GLOBAL:
+    A large river may enter the HRU from outside with enormous global
+    accumulation. Using global accumulation to order cells causes those
+    river-entry cells to be processed first, before their downstream
+    neighbours within the HRU are resolved — they get NaN and the path
+    is broken. Local accumulation gives the correct topological order.
+    """
+    MR, MC   = fdir.shape
+    in_count = np.zeros((MR, MC), dtype=np.int32)
+
+    for code, (dr, dc, _) in D8.items():
+        r0,r1   = max(0,-dr), MR-max(0,dr)
+        c0,c1   = max(0,-dc), MC-max(0,dc)
+        nr0,nr1 = max(0,dr),  MR-max(0,-dr)
+        nc0,nc1 = max(0,dc),  MC-max(0,-dc)
+        # Only count flow between two cells that are BOTH inside the HRU
+        drains = ((fdir[r0:r1,c0:c1] == code)
+                  & mask[r0:r1,c0:c1]
+                  & mask[nr0:nr1,nc0:nc1])
+        in_count[nr0:nr1, nc0:nc1] += drains.astype(np.int32)
+
+    facc_local = np.zeros((MR, MC), dtype=np.float64)
+    facc_local[mask] = 1.0
+    rem = in_count.copy()
+
+    # Seed: HRU cells that receive no flow from other HRU cells (divides)
+    q = deque(zip(*np.where(mask & (rem == 0))))
+    while q:
+        r, c = q.popleft()
+        d = int(fdir[r, c])
+        if d not in D8:
+            continue
+        dr, dc, _ = D8[d]
+        r2, c2 = r + dr, c + dc
+        if 0 <= r2 < MR and 0 <= c2 < MC and mask[r2, c2]:
+            facc_local[r2, c2] += facc_local[r, c]
+            rem[r2, c2] -= 1
+            if rem[r2, c2] == 0:
+                q.append((r2, c2))
+
+    return facc_local
+
+
+def _routing_length(hru_mask, fdir_arr):
+    """
+    Longest D8 flow path (metres) within the HRU =
+    distance from the farthest upstream cell (true divide) to the outlet.
+
+    1. OVERLAY      : Extract cells inside the HRU polygon.
+    2. LOCAL FACC   : Compute flow accumulation using only intra-HRU flow.
+    3. OUTLET       : Boundary cell with highest LOCAL accumulation
+                      (most HRU cells drain through it).
+    4. ORDER        : Process cells descending local accumulation
+                      → outlet resolved first, divide cells resolved last.
+                      This guarantees every cell's downstream neighbour is
+                      already computed before the cell itself is processed.
+    5. PATH LENGTHS : path_len[cell] = step + path_len[downstream neighbour]
+    6. RESULT       : max(path_len) = full divide-to-outlet distance.
     """
     r_idx, c_idx = np.where(hru_mask)
     if len(r_idx) == 0:
         return np.nan
 
-    # Clip to bounding box of HRU (+ 1-cell pad)
     pad  = 1
     rmin = max(0, int(r_idx.min()) - pad)
     rmax = min(fdir_arr.shape[0], int(r_idx.max()) + pad + 1)
@@ -289,94 +344,83 @@ def _routing_length(hru_mask, fdir_arr, facc_arr):
 
     mask = hru_mask[rmin:rmax, cmin:cmax]
     fdir = fdir_arr[rmin:rmax, cmin:cmax]
-    facc = facc_arr[rmin:rmax, cmin:cmax]
     rl   = r_idx - rmin
     cl   = c_idx - cmin
     MR, MC = mask.shape
 
-    # ------------------------------------------------------------------
-    # 2. Find main outlet: boundary cell with highest flow accumulation
-    # ------------------------------------------------------------------
-    out_r, out_c, out_dist = None, None, None
-    max_acc = -1.0
+    # ── LOCAL flow accumulation ───────────────────────────────────────────
+    facc_local = _local_flow_accumulation(fdir, mask)
 
+    # ── Main outlet: boundary cell with highest LOCAL accumulation ────────
+    out_r, out_c, out_dist = None, None, None
+    max_local_acc = -1.0
     for r, c in zip(rl, cl):
         d = int(fdir[r, c])
         if d not in D8:
             continue
         dr, dc, dist = D8[d]
-        nr2, nc2 = r + dr, c + dc
-        exits = (nr2 < 0 or nr2 >= MR or nc2 < 0 or nc2 >= MC
-                 or not mask[nr2, nc2])
-        if exits and facc[r, c] > max_acc:
-            max_acc          = facc[r, c]
+        r2, c2 = r + dr, c + dc
+        exits = (r2 < 0 or r2 >= MR or c2 < 0 or c2 >= MC
+                 or not mask[r2, c2])
+        if exits and facc_local[r, c] > max_local_acc:
+            max_local_acc    = facc_local[r, c]
             out_r, out_c     = r, c
             out_dist         = dist
 
     if out_r is None:
         return np.nan
 
-    # ------------------------------------------------------------------
-    # 3. Compute path lengths (downstream cells first)
-    #    Sorting by descending accumulation guarantees every cell's
-    #    downstream neighbour is processed before the cell itself.
-    # ------------------------------------------------------------------
+    # ── Path lengths (outlet first → divide last) ─────────────────────────
     path_len = np.full((MR, MC), np.nan)
-    path_len[out_r, out_c] = out_dist   # outlet: one step to exit
+    path_len[out_r, out_c] = out_dist
 
-    order = np.argsort(-facc[rl, cl])   # descending accumulation
+    order = np.argsort(-facc_local[rl, cl])   # descending LOCAL accumulation
     for r, c in zip(rl[order], cl[order]):
         if not np.isnan(path_len[r, c]):
-            continue                     # already resolved
+            continue
         d = int(fdir[r, c])
         if d not in D8:
             continue
         dr, dc, dist = D8[d]
-        nr2, nc2 = r + dr, c + dc
-        exits = (nr2 < 0 or nr2 >= MR or nc2 < 0 or nc2 >= MC
-                 or not mask[nr2, nc2])
-        if not exits and not np.isnan(path_len[nr2, nc2]):
-            path_len[r, c] = dist + path_len[nr2, nc2]
-        # cells that exit elsewhere stay NaN (don't belong to main path)
+        r2, c2 = r + dr, c + dc
+        exits = (r2 < 0 or r2 >= MR or c2 < 0 or c2 >= MC
+                 or not mask[r2, c2])
+        if not exits and not np.isnan(path_len[r2, c2]):
+            path_len[r, c] = dist + path_len[r2, c2]
 
-    # ------------------------------------------------------------------
-    # 4. Routing length = max path to the main outlet
-    # ------------------------------------------------------------------
-    vals = path_len[rl, cl]
+    # ── Routing length = longest path to the main outlet ─────────────────
+    vals       = path_len[rl, cl]
     valid_vals = vals[~np.isnan(vals)]
-
     if len(valid_vals) > 0:
         return float(np.nanmax(valid_vals))
 
-    # Fallback: no cell reached the main outlet (complex HRU topology)
-    # → compute max path to ANY boundary exit
-    path_any = np.full((MR, MC), np.nan)
+    # Fallback: max path to ANY boundary exit (e.g. HRU with multiple exits)
     for r, c in zip(rl, cl):
         d = int(fdir[r, c])
         if d not in D8:
-            path_any[r, c] = 0.0
+            path_len[r, c] = 0.0
             continue
         dr, dc, dist = D8[d]
-        nr2, nc2 = r + dr, c + dc
-        exits = (nr2 < 0 or nr2 >= MR or nc2 < 0 or nc2 >= MC
-                 or not mask[nr2, nc2])
+        r2, c2 = r + dr, c + dc
+        exits = (r2 < 0 or r2 >= MR or c2 < 0 or c2 >= MC
+                 or not mask[r2, c2])
         if exits:
-            path_any[r, c] = dist
+            path_len[r, c] = dist
 
     for r, c in zip(rl[order], cl[order]):
-        if not np.isnan(path_any[r, c]):
+        if not np.isnan(path_len[r, c]):
             continue
         d = int(fdir[r, c])
         if d not in D8:
             continue
         dr, dc, dist = D8[d]
-        nr2, nc2 = r + dr, c + dc
-        if (0 <= nr2 < MR and 0 <= nc2 < MC
-                and mask[nr2, nc2]
-                and not np.isnan(path_any[nr2, nc2])):
-            path_any[r, c] = dist + path_any[nr2, nc2]
+        r2, c2 = r + dr, c + dc
+        if (0 <= r2 < MR and 0 <= c2 < MC
+                and mask[r2, c2]
+                and not np.isnan(path_len[r2, c2])):
+            path_len[r, c] = dist + path_len[r2, c2]
 
-    fallback = path_any[rl, cl]
+    fallback = path_len[rl, cl]
     fallback = fallback[~np.isnan(fallback)]
     return float(np.nanmax(fallback)) if len(fallback) > 0 else np.nan
 
@@ -451,7 +495,7 @@ for i, (_, row) in enumerate(hru_gdf.iterrows()):
             f"DEM is nearly flat here (pit-fill artifact?)  *** CHECK DEM ***"
         )
 
-    rl = _routing_length(hru_mask, fdir_full, facc_full)
+    rl = _routing_length(hru_mask, fdir_full)
 
     records.append({
         "HRU_ID":           hru_id,

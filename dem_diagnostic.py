@@ -385,7 +385,38 @@ else:
         cl = c_idx - cmin
         MR, MC = mask_c.shape
 
-        # ── Recompute routing path for this HRU ─────────────────────────
+        # ── Recompute routing path using LOCAL accumulation ──────────────
+        # LOCAL accumulation: only count flow between cells inside the HRU.
+        # This prevents large rivers entering from outside (with huge global
+        # accumulation) from being processed before their downstream HRU
+        # neighbours, which would leave the upper cells with NaN path lengths.
+        in_count_loc = np.zeros((MR, MC), dtype=np.int32)
+        for code, (dr_, dc_, _) in D8.items():
+            r0_,r1_   = max(0,-dr_), MR-max(0,dr_)
+            c0_,c1_   = max(0,-dc_), MC-max(0,dc_)
+            nr0_,nr1_ = max(0,dr_),  MR-max(0,-dr_)
+            nc0_,nc1_ = max(0,dc_),  MC-max(0,-dc_)
+            drains_ = ((fdir_c[r0_:r1_,c0_:c1_] == code)
+                       & mask_c[r0_:r1_,c0_:c1_]
+                       & mask_c[nr0_:nr1_,nc0_:nc1_])
+            in_count_loc[nr0_:nr1_, nc0_:nc1_] += drains_.astype(np.int32)
+
+        facc_loc = np.zeros((MR, MC), dtype=np.float64)
+        facc_loc[mask_c] = 1.0
+        rem_loc  = in_count_loc.copy()
+        q_loc    = deque(zip(*np.where(mask_c & (rem_loc == 0))))
+        while q_loc:
+            r_, c_ = q_loc.popleft()
+            d_ = int(fdir_c[r_, c_])
+            if d_ not in D8: continue
+            dr_, dc_, _ = D8[d_]
+            r2_, c2_ = r_+dr_, c_+dc_
+            if 0<=r2_<MR and 0<=c2_<MC and mask_c[r2_,c2_]:
+                facc_loc[r2_,c2_] += facc_loc[r_,c_]
+                rem_loc[r2_,c2_]  -= 1
+                if rem_loc[r2_,c2_] == 0:
+                    q_loc.append((r2_,c2_))
+
         out_r, out_c, out_dist = None, None, None
         max_acc = -1.0
         for r, c in zip(rl, cl):
@@ -396,14 +427,14 @@ else:
             r2, c2 = r + dr, c + dc
             exits = (r2 < 0 or r2 >= MR or c2 < 0 or c2 >= MC
                      or not mask_c[r2, c2])
-            if exits and facc_c[r, c] > max_acc:
-                max_acc = facc_c[r, c]
+            if exits and facc_loc[r, c] > max_acc:
+                max_acc = facc_loc[r, c]
                 out_r, out_c, out_dist = r, c, dist
 
         path_len = np.full((MR, MC), np.nan)
         if out_r is not None:
             path_len[out_r, out_c] = out_dist
-            order = np.argsort(-facc_c[rl, cl])
+            order = np.argsort(-facc_loc[rl, cl])   # LOCAL order
             for r, c in zip(rl[order], cl[order]):
                 if not np.isnan(path_len[r, c]):
                     continue

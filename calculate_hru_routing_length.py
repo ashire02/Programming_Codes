@@ -382,14 +382,20 @@ def _routing_length(hru_mask, fdir_arr, facc_arr):
 
 
 # ── Process every HRU polygon ─────────────────────────────────────────────────
-records = []
+records    = []
+warn_lines = []   # DEM quality warnings collected here
+
+print(f"  {'HRU':>4}  {'cells':>6}  {'NaN':>6}  {'NaN%':>5}  "
+      f"{'elev_min':>9}  {'elev_max':>9}  {'routing_m':>10}  {'area_m2':>14}")
+print(f"  {'-'*4}  {'-'*6}  {'-'*6}  {'-'*5}  "
+      f"{'-'*9}  {'-'*9}  {'-'*10}  {'-'*14}")
 
 for i, (_, row) in enumerate(hru_gdf.iterrows()):
     hru_id = row[HRU_ID_FIELD]
     geom   = row.geometry
 
     if geom is None or geom.is_empty:
-        print(f"  [{i+1:>3}/{n_polys}] HRU {hru_id}: empty geometry — skipped")
+        print(f"  HRU {hru_id}: empty geometry — skipped")
         continue
 
     # Area in m²
@@ -415,11 +421,35 @@ for i, (_, row) in enumerate(hru_gdf.iterrows()):
 
     n_cells = int(hru_mask.sum())
     if n_cells == 0:
-        print(f"  [{i+1:>3}/{n_polys}] HRU {hru_id}: no DEM cells — skipped")
+        print(f"  HRU {hru_id}: no overlapping DEM cells — "
+              f"HRU may lie OUTSIDE the DEM extent  *** CHECK DEM ***")
+        warn_lines.append(f"  HRU {hru_id}: zero DEM cells — outside DEM extent?")
         continue
 
     if area_m2 is None:
         area_m2 = n_cells * cell_x_m * cell_y_m
+
+    # ── DEM quality check within this HRU ─────────────────────────────────
+    elev_in_hru  = dem_full[hru_mask]
+    n_nan        = int(np.isnan(elev_in_hru).sum())
+    nan_pct      = 100.0 * n_nan / n_cells
+    valid_elevs  = elev_in_hru[~np.isnan(elev_in_hru)]
+    elev_min     = float(valid_elevs.min()) if len(valid_elevs) > 0 else np.nan
+    elev_max     = float(valid_elevs.max()) if len(valid_elevs) > 0 else np.nan
+    elev_range   = elev_max - elev_min if not np.isnan(elev_min) else np.nan
+    n_valid      = n_cells - n_nan
+
+    # Flag suspicious HRUs
+    if nan_pct > 20:
+        warn_lines.append(
+            f"  HRU {hru_id:>3}: {nan_pct:.0f}% of cells are NaN — "
+            f"DEM has nodata gaps inside this HRU  *** CHECK DEM ***"
+        )
+    if n_valid > 4 and elev_range < cell_y_m:
+        warn_lines.append(
+            f"  HRU {hru_id:>3}: elevation range only {elev_range:.1f} m — "
+            f"DEM is nearly flat here (pit-fill artifact?)  *** CHECK DEM ***"
+        )
 
     rl = _routing_length(hru_mask, fdir_full, facc_full)
 
@@ -428,13 +458,35 @@ for i, (_, row) in enumerate(hru_gdf.iterrows()):
         "routing_length_m": round(rl, 3) if not np.isnan(rl) else np.nan,
         "area_m2":          round(area_m2, 2),
         "n_cells":          n_cells,
+        "n_nan_cells":      n_nan,
+        "nan_pct":          round(nan_pct, 1),
+        "elev_min_m":       round(elev_min, 1) if not np.isnan(elev_min) else np.nan,
+        "elev_max_m":       round(elev_max, 1) if not np.isnan(elev_max) else np.nan,
+        "elev_range_m":     round(elev_range, 1) if not np.isnan(elev_range) else np.nan,
     })
 
-    print(f"  [{i+1:>3}/{n_polys}] HRU {str(hru_id):>4} | "
-          f"routing_length = {rl:>9.2f} m | "
-          f"area = {area_m2:>14,.1f} m²")
+    print(f"  {str(hru_id):>4}  {n_cells:>6}  {n_nan:>6}  {nan_pct:>4.0f}%  "
+          f"{elev_min:>9.1f}  {elev_max:>9.1f}  {rl:>10.2f}  {area_m2:>14,.1f}")
 
 print(f"\n      Valid polygons: {len(records)}")
+
+# ── Print DEM quality warnings ────────────────────────────────────────────────
+if warn_lines:
+    print(f"\n{'!'*60}")
+    print("  DEM QUALITY WARNINGS")
+    print(f"{'!'*60}")
+    for w in warn_lines:
+        print(w)
+    print(f"{'!'*60}")
+    print("\n  These HRUs may produce unreliable routing lengths.")
+    print("  Recommended checks:")
+    print("  1. Open the DEM and HRU shapefile together in QGIS or ArcGIS")
+    print("  2. Confirm the HRU polygon overlaps valid DEM data visually")
+    print("  3. Check for nodata gaps or flat areas inside the flagged HRUs")
+    print("  4. If the DEM has large flat areas, consider using the original")
+    print("     unfilled DEM or a higher-resolution source (SRTM/Copernicus 30m)")
+else:
+    print("\n  No DEM quality warnings — all HRUs have valid elevation coverage.")
 
 
 # =============================================================================
@@ -459,6 +511,11 @@ def _agg(group):
         "total_area_m2":    round(w.sum(), 2),
         "n_polygons":       len(group),
         "total_cells":      int(group["n_cells"].sum()),
+        "total_nan_cells":  int(group["n_nan_cells"].sum()),
+        "nan_pct":          round(group["nan_pct"].mean(), 1),
+        "elev_min_m":       round(group["elev_min_m"].min(), 1),
+        "elev_max_m":       round(group["elev_max_m"].max(), 1),
+        "elev_range_m":     round(group["elev_range_m"].max(), 1),
     })
 
 

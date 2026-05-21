@@ -1,21 +1,39 @@
 # =============================================================================
-# HRU ROUTING LENGTH CALCULATOR
-# Uses DEM-derived D8 flow directions to compute the mean overland flow path
-# length (routing length) for each HRU polygon, in metres.
+# HRU ROUTING LENGTH — LONGEST FLOW PATH (DIVIDE → OUTLET)
+# =============================================================================
 #
-# Duplicate HRU IDs (same number in multiple polygons) are resolved by taking
-# the area-weighted average of routing lengths across all matching polygons.
+# CONCEPT
+# -------
+# The routing length of an HRU is the LENGTH OF THE LONGEST D8 FLOW PATH
+# within that HRU — from the farthest upstream cell (watershed divide) to the
+# main outlet of the HRU.
+#
+# HOW THE DEM IS USED
+# -------------------
+#   Step 1 — Overlay  : The HRU shapefile is draped on top of the DEM.
+#                        Only DEM cells that fall inside the HRU are used.
+#   Step 2 — D8 dir   : The DEM elevation surface determines which direction
+#                        water flows from every cell (steepest downslope
+#                        neighbour among 8 surrounding cells).
+#   Step 3 — Flow acc : Count how many upstream cells drain through each cell.
+#                        High-accumulation cells = the main channel / valley.
+#                        Zero-accumulation cells = ridges / divides.
+#   Step 4 — Outlet   : The main outlet of the HRU = the boundary cell
+#                        (D8 exits the HRU polygon) with the HIGHEST flow
+#                        accumulation — where most water leaves the HRU.
+#   Step 5 — Routing  : For every cell whose D8 path reaches the main outlet,
+#                        measure the total path length to that outlet.
+#                        Routing length = MAXIMUM of those lengths.
+#                        = distance from the farthest divide cell to the outlet.
 #
 # Requirements:
 #   pip install geopandas rasterio numpy pandas shapely
 # =============================================================================
 
-
-# -----------------------------------------------------------------------------
-# SECTION 1 — IMPORTS
-# -----------------------------------------------------------------------------
 import os
 import warnings
+from collections import deque
+
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -25,312 +43,368 @@ from rasterio.features import rasterize
 warnings.filterwarnings("ignore")
 
 
-# -----------------------------------------------------------------------------
-# SECTION 2 — USER-CONFIGURABLE PATHS AND SETTINGS
-# -----------------------------------------------------------------------------
+# =============================================================================
+# USER-CONFIGURABLE SETTINGS
+# =============================================================================
 
-# -- Input files --------------------------------------------------------------
-# Update the filenames below to match your actual files.
-# Common DEM extensions: .tif, .tiff, .img, .asc
-# Common HRU shapefile: .shp
+HRU_SHAPEFILE = r"C:\Users\ash_i\Downloads\routing_length\hru\NO_HRU_UTM45_merge.shp"
+DEM_RASTER    = r"C:\Users\ash_i\Downloads\routing_length\phorse_dem\demphortfilll.tif"
+OUTPUT_DIR    = r"C:\Users\ash_i\Downloads\routing_length\results"
+OUTPUT_CSV    = os.path.join(OUTPUT_DIR, "hru_routing_lengths.csv")
 
-HRU_SHAPEFILE = r"C:\Users\ash_i\Downloads\routing_length\hru.shp"
-DEM_RASTER    = r"C:\Users\ash_i\Downloads\routing_length\dem.tif"
-
-# -- Output -------------------------------------------------------------------
-# A 'results' folder is created inside the input folder automatically.
-
-OUTPUT_DIR = r"C:\Users\ash_i\Downloads\routing_length\results"
-OUTPUT_CSV = os.path.join(OUTPUT_DIR, "hru_routing_lengths.csv")
-
-# -- HRU identifier column ----------------------------------------------------
-# Set to the exact column name that holds HRU numbers/IDs, e.g. "HRU_ID".
-# Set to None to let the script auto-detect it from the shapefile columns.
-
-HRU_ID_FIELD = None   # e.g. "HRU_ID" or "HRUID" or "Subbasin"
+# Exact column name holding HRU IDs (set to None to auto-detect)
+HRU_ID_FIELD  = "h_r_u"
 
 
-# -----------------------------------------------------------------------------
-# SECTION 3 — LOAD DATA
-# -----------------------------------------------------------------------------
+# =============================================================================
+# STEP 1 — LOAD DATA
+# =============================================================================
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-print(f"Output directory : {OUTPUT_DIR}")
 
-print("\n[1/5] Loading HRU shapefile ...")
+print("[1/6] Loading HRU shapefile ...")
 hru_gdf = gpd.read_file(HRU_SHAPEFILE)
 n_polys = len(hru_gdf)
-print(f"      Polygons  : {n_polys}")
-print(f"      CRS       : {hru_gdf.crs}")
+print(f"      {n_polys} polygons   CRS: {hru_gdf.crs}")
 
-# Print all columns with types, unique counts, and sample values so the user
-# can verify which column holds the HRU numbers.
-non_geom_cols = [c for c in hru_gdf.columns if c.lower() != "geometry"]
-print(f"\n      {'Column':<20} {'dtype':<12} {'unique':>6}  {'sample values'}")
-print(f"      {'-'*20} {'-'*12} {'-'*6}  {'-'*30}")
-for col in non_geom_cols:
-    uvals  = hru_gdf[col].nunique()
-    sample = hru_gdf[col].dropna().unique()[:4].tolist()
-    print(f"      {col:<20} {str(hru_gdf[col].dtype):<12} {uvals:>6}  {sample}")
+non_geom = [c for c in hru_gdf.columns if c.lower() != "geometry"]
+print(f"\n      {'Column':<22} {'dtype':<12} {'unique':>6}  sample values")
+print(f"      {'-'*22} {'-'*12} {'-'*6}  {'-'*30}")
+for col in non_geom:
+    print(f"      {col:<22} {str(hru_gdf[col].dtype):<12} "
+          f"{hru_gdf[col].nunique():>6}  "
+          f"{hru_gdf[col].dropna().unique()[:4].tolist()}")
 
-# Auto-detect HRU ID field if not specified.
-# Strategy: find the integer-type column whose unique-value count is the
-# smallest among those that are (a) numeric and (b) have more than 1 unique
-# value and (c) have values that look like small positive integers (HRU IDs).
 if HRU_ID_FIELD is None:
     candidates = []
-    for col in non_geom_cols:
-        ser = hru_gdf[col]
-        ucount = ser.nunique()
-        if ucount < 2:
+    for col in non_geom:
+        num = pd.to_numeric(hru_gdf[col], errors="coerce")
+        if num.notna().mean() < 0.9:
             continue
-        # Try to coerce to numeric
-        num = pd.to_numeric(ser, errors="coerce")
-        frac_numeric = num.notna().mean()
-        if frac_numeric < 0.9:
-            continue
-        # Values should look like small positive integers
         vals = num.dropna()
         if vals.min() < 0 or vals.max() > 10_000:
             continue
-        # Prefer columns where unique count << n_polys (groups exist)
-        candidates.append((col, ucount, frac_numeric))
-
-    if candidates:
-        # Pick column with fewest unique values (most "grouped") that is
-        # also closest to what we expect (ucount <= n_polys)
-        candidates.sort(key=lambda x: x[1])
-        HRU_ID_FIELD = candidates[0][0]
-    else:
-        # Last resort: use first non-geometry column
-        HRU_ID_FIELD = non_geom_cols[0]
-
-    print(f"\n      >>> HRU ID field selected : '{HRU_ID_FIELD}'")
-    print(f"          Unique HRU IDs found  : {hru_gdf[HRU_ID_FIELD].nunique()}")
-    print(f"          Set HRU_ID_FIELD at the top if this looks wrong.")
+        ucount = hru_gdf[col].nunique()
+        if ucount < 2:
+            continue
+        is_int = bool((vals == vals.round()).all())
+        score  = (3 * is_int) + (2 * (abs(vals.max() - ucount) <= max(3, ucount * 0.1)))
+        candidates.append((col, ucount, score))
+    candidates.sort(key=lambda x: (-x[2], -x[1]))
+    HRU_ID_FIELD = candidates[0][0] if candidates else non_geom[0]
+    print(f"\n      >>> Auto-detected HRU ID field: '{HRU_ID_FIELD}'")
+    print("          Set HRU_ID_FIELD at the top if wrong.")
 else:
-    print(f"\n      HRU ID field (user-set) : '{HRU_ID_FIELD}'")
+    print(f"\n      HRU ID field: '{HRU_ID_FIELD}'  "
+          f"({hru_gdf[HRU_ID_FIELD].nunique()} unique values)")
 
-print("\n[1/5] Loading DEM ...")
+print("\n[1/6] Loading DEM ...")
 with rasterio.open(DEM_RASTER) as src:
     dem_full   = src.read(1).astype(np.float64)
     transform  = src.transform
     dem_crs    = src.crs
     nodata_val = src.nodata if src.nodata is not None else -9999.0
     n_rows, n_cols = dem_full.shape
-    cell_w = abs(transform.a)   # pixel width  in CRS units
-    cell_h = abs(transform.e)   # pixel height in CRS units
-
-print(f"      Shape     : {n_rows} x {n_cols}")
-print(f"      CRS       : {dem_crs}")
-print(f"      Cell size : {cell_w:.6f} x {cell_h:.6f} CRS units")
-print(f"      NoData    : {nodata_val}")
+    cell_w = abs(transform.a)
+    cell_h = abs(transform.e)
 
 dem_full[dem_full == nodata_val] = np.nan
+print(f"      Shape: {n_rows} x {n_cols}   CRS: {dem_crs}")
 
 
-# -----------------------------------------------------------------------------
-# SECTION 4 — CRS ALIGNMENT AND CELL SIZE IN METRES
-# -----------------------------------------------------------------------------
-print("\n[2/5] Aligning coordinate reference systems ...")
+# =============================================================================
+# STEP 2 — CRS ALIGNMENT + CELL SIZES IN METRES
+# =============================================================================
+print("\n[2/6] Aligning CRS ...")
 
 if hru_gdf.crs is None:
-    raise ValueError(
-        "The HRU shapefile has no CRS. Assign a CRS before running this script."
-    )
+    raise ValueError("HRU shapefile has no CRS.")
 
 if hru_gdf.crs != dem_crs:
-    print(f"      Reprojecting HRU: {hru_gdf.crs}  →  {dem_crs}")
+    print(f"      Reprojecting HRU: {hru_gdf.crs} → {dem_crs}")
     hru_gdf = hru_gdf.to_crs(dem_crs)
 
-# Determine representative cell size in metres
+# Geographic CRS: longitude degrees are shorter than latitude degrees —
+# use separate x and y cell sizes so diagonal distances are correct.
 if dem_crs.is_geographic:
-    # Degrees → metres: 1° ≈ 111 320 m, adjusted for latitude
-    # union_all() is geopandas ≥0.14; unary_union works on all versions
     try:
-        combined = hru_gdf.geometry.union_all()
+        union = hru_gdf.geometry.union_all()
     except AttributeError:
-        combined = hru_gdf.geometry.unary_union
-    centroid_lat = float(combined.centroid.y)
-    cell_size_m  = cell_w * 111_320.0 * abs(np.cos(np.radians(centroid_lat)))
-    print(f"      Geographic CRS  →  estimated cell size = {cell_size_m:.2f} m "
-          f"(at lat {centroid_lat:.3f}°)")
+        union = hru_gdf.geometry.unary_union
+    lat      = float(union.centroid.y)
+    cell_x_m = cell_w * 111_320.0 * abs(np.cos(np.radians(lat)))
+    cell_y_m = cell_h * 111_320.0
+    print(f"      Geographic CRS → cell_x={cell_x_m:.2f} m  cell_y={cell_y_m:.2f} m")
 else:
-    cell_size_m = (cell_w + cell_h) / 2.0
-    print(f"      Projected CRS  →  cell size = {cell_size_m:.2f} m")
+    cell_x_m = float(cell_w)
+    cell_y_m = float(cell_h)
+    print(f"      Projected CRS  → cell_x={cell_x_m:.2f} m  cell_y={cell_y_m:.2f} m")
+
+diag_m = float(np.sqrt(cell_x_m**2 + cell_y_m**2))
+
+# D8 code → (row_offset, col_offset, step_distance_m)
+D8 = {
+     64: (-1,  0, cell_y_m),   # N
+    128: (-1,  1, diag_m),     # NE
+      1: ( 0,  1, cell_x_m),   # E
+      2: ( 1,  1, diag_m),     # SE
+      4: ( 1,  0, cell_y_m),   # S
+      8: ( 1, -1, diag_m),     # SW
+     16: ( 0, -1, cell_x_m),   # W
+     32: (-1, -1, diag_m),     # NW
+}
 
 
-# -----------------------------------------------------------------------------
-# SECTION 5 — D8 FLOW DIRECTION
-# -----------------------------------------------------------------------------
-print("\n[3/5] Computing D8 flow direction ...")
+# =============================================================================
+# STEP 3 — D8 FLOW DIRECTION
+# =============================================================================
+print("\n[3/6] Computing D8 flow direction ...")
 
 
-def _compute_d8_flow_direction(dem_arr: np.ndarray, cell_size: float) -> np.ndarray:
-    """
-    Vectorised D8 flow direction.
-    Each cell is assigned to the neighbour with the steepest downslope gradient.
-    Direction codes (ESRI convention):
-        64=N  128=NE  1=E  2=SE  4=S  8=SW  16=W  32=NW  0=sink/nodata
-    """
-    # (row_offset, col_offset, code, distance_multiplier)
-    neighbors = [
-        (-1,  0,  64, 1.0),
-        (-1,  1, 128, 1.41421356),
-        ( 0,  1,   1, 1.0),
-        ( 1,  1,   2, 1.41421356),
-        ( 1,  0,   4, 1.0),
-        ( 1, -1,   8, 1.41421356),
-        ( 0, -1,  16, 1.0),
-        (-1, -1,  32, 1.41421356),
+def _compute_d8(dem, cx, cy):
+    diag = np.sqrt(cx**2 + cy**2)
+    nbrs = [
+        (-1,  0,  64, cy),
+        (-1,  1, 128, diag),
+        ( 0,  1,   1, cx),
+        ( 1,  1,   2, diag),
+        ( 1,  0,   4, cy),
+        ( 1, -1,   8, diag),
+        ( 0, -1,  16, cx),
+        (-1, -1,  32, diag),
     ]
+    nr, nc   = dem.shape
+    valid    = ~np.isnan(dem)
+    best_slp = np.full((nr, nc), -np.inf)
+    fdir     = np.zeros((nr, nc), dtype=np.int16)
 
-    nr, nc    = dem_arr.shape
-    valid     = ~np.isnan(dem_arr)
-    best_slp  = np.full((nr, nc), -np.inf)
-    flow_dir  = np.zeros((nr, nc), dtype=np.int16)
-
-    for dr, dc, code, dmult in neighbors:
+    for dr, dc, code, dist in nbrs:
         r0, r1   = max(0, -dr), nr - max(0,  dr)
         c0, c1   = max(0, -dc), nc - max(0,  dc)
         nr0, nr1 = max(0,  dr), nr - max(0, -dr)
         nc0, nc1 = max(0,  dc), nc - max(0, -dc)
-
-        cur  = dem_arr[r0:r1, c0:c1]
-        nbr  = dem_arr[nr0:nr1, nc0:nc1]
+        cur  = dem[r0:r1, c0:c1]
+        nbr  = dem[nr0:nr1, nc0:nc1]
         ok   = valid[r0:r1, c0:c1] & valid[nr0:nr1, nc0:nc1]
-
-        slp  = np.where(ok, (cur - nbr) / (dmult * cell_size), -np.inf)
+        slp  = np.where(ok, (cur - nbr) / dist, -np.inf)
         better = slp > best_slp[r0:r1, c0:c1]
+        best_slp[r0:r1, c0:c1] = np.where(better, slp,  best_slp[r0:r1, c0:c1])
+        fdir[r0:r1, c0:c1]     = np.where(better, code, fdir[r0:r1, c0:c1])
 
-        best_slp[r0:r1, c0:c1]  = np.where(better, slp, best_slp[r0:r1, c0:c1])
-        flow_dir[r0:r1, c0:c1]  = np.where(better, code, flow_dir[r0:r1, c0:c1])
-
-    return flow_dir
-
-
-flow_dir_full = _compute_d8_flow_direction(dem_full, cell_size_m)
-print("      Done.")
+    return fdir
 
 
-# -----------------------------------------------------------------------------
-# SECTION 6 — ROUTING LENGTH PER HRU POLYGON
-# -----------------------------------------------------------------------------
+# Tiny random perturbation breaks elevation ties on flat areas that are
+# common in pit-filled DEMs; ensures every valid cell gets a D8 direction.
+rng        = np.random.default_rng(42)
+dem_for_d8 = dem_full.copy()
+valid_mask = ~np.isnan(dem_for_d8)
+dem_for_d8[valid_mask] += rng.uniform(0, 1e-4, int(valid_mask.sum()))
 
-# D8 direction code → (row offset, col offset, distance multiplier)
-_D8_OFFSETS = {
-     64: (-1,  0, 1.0),
-    128: (-1,  1, 1.41421356),
-      1: ( 0,  1, 1.0),
-      2: ( 1,  1, 1.41421356),
-      4: ( 1,  0, 1.0),
-      8: ( 1, -1, 1.41421356),
-     16: ( 0, -1, 1.0),
-     32: (-1, -1, 1.41421356),
-}
+fdir_full = _compute_d8(dem_for_d8, cell_x_m, cell_y_m)
+n_sinks   = int(((fdir_full == 0) & valid_mask).sum())
+print(f"      Done.  Remaining sink cells: {n_sinks:,}")
 
 
-def _routing_length_for_hru(
-    hru_mask: np.ndarray,
-    dem_arr:  np.ndarray,
-    fdir_arr: np.ndarray,
-    cell_size: float,
-) -> float:
+# =============================================================================
+# STEP 4 — FLOW ACCUMULATION
+# =============================================================================
+print("\n[4/6] Computing flow accumulation ...")
+
+
+def _flow_accumulation(fdir, valid):
     """
-    Compute the mean D8 flow-path routing length (metres) for one HRU.
+    D8 flow accumulation via topological sort (Kahn's algorithm).
+    Returns the number of upstream cells that drain through each cell
+    (including the cell itself → minimum value = 1 for valid cells).
+    """
+    nr, nc = fdir.shape
 
-    For each DEM cell inside the HRU the D8 path is traced downstream until
-    it leaves the HRU boundary.  Each cell's 'routing length' is the
-    accumulated travel distance along that path.
+    # Count upstream contributors for each cell (in-degree in flow graph)
+    in_count = np.zeros((nr, nc), dtype=np.int32)
+    for code, (dr, dc, _) in D8.items():
+        r0, r1   = max(0, -dr), nr - max(0,  dr)
+        c0, c1   = max(0, -dc), nc - max(0,  dc)
+        nr0, nr1 = max(0,  dr), nr - max(0, -dr)
+        nc0, nc1 = max(0,  dc), nc - max(0, -dc)
+        drains = (fdir[r0:r1, c0:c1] == code) & valid[r0:r1, c0:c1]
+        in_count[nr0:nr1, nc0:nc1] += drains.astype(np.int32)
 
-    Cells are processed in ascending elevation order so that outlet cells
-    (lowest elevation, i.e. first to drain out) are resolved before the
-    headwater cells that depend on them.
+    facc      = np.zeros((nr, nc), dtype=np.float64)
+    facc[valid] = 1.0
+    remaining = in_count.copy()
 
-    Returns
-    -------
-    float : mean routing length in metres, or NaN if no valid cells exist.
+    # Seed: cells with no upstream neighbours
+    queue = deque(zip(*np.where(valid & (remaining == 0))))
+
+    while queue:
+        r, c = queue.popleft()
+        d = int(fdir[r, c])
+        if d not in D8:
+            continue
+        dr, dc, _ = D8[d]
+        nr2, nc2  = r + dr, c + dc
+        if 0 <= nr2 < nr and 0 <= nc2 < nc and valid[nr2, nc2]:
+            facc[nr2, nc2] += facc[r, c]
+            remaining[nr2, nc2] -= 1
+            if remaining[nr2, nc2] == 0:
+                queue.append((nr2, nc2))
+
+    return facc
+
+
+facc_full = _flow_accumulation(fdir_full, valid_mask)
+print(f"      Done.  Max accumulation: {facc_full.max():,.0f} cells")
+
+
+# =============================================================================
+# STEP 5 — ROUTING LENGTH PER HRU
+# =============================================================================
+print(f"\n[5/6] Computing routing lengths for {n_polys} HRUs ...")
+
+
+def _routing_length(hru_mask, fdir_arr, facc_arr):
+    """
+    Longest D8 flow path (metres) within the HRU.
+
+    1. OVERLAY  : Extract only cells inside the HRU polygon.
+    2. OUTLET   : Find the main outlet = HRU boundary cell (D8 exits polygon)
+                  with the highest flow accumulation.
+    3. PATH LEN : For each cell, trace D8 downstream within the HRU.
+                  Record path length only if it reaches the main outlet.
+    4. RESULT   : Maximum recorded path length
+                  = distance from the watershed divide to the outlet.
+
+    Falls back to max-path-to-any-exit if no cell drains to the main outlet.
     """
     r_idx, c_idx = np.where(hru_mask)
     if len(r_idx) == 0:
         return np.nan
 
-    elevs = dem_arr[r_idx, c_idx]
-    ok    = ~np.isnan(elevs)
-    r_idx, c_idx, elevs = r_idx[ok], c_idx[ok], elevs[ok]
-    if len(r_idx) == 0:
-        return np.nan
-
-    # Clip arrays to HRU bounding box (+ 1-cell pad) for memory efficiency
+    # Clip to bounding box of HRU (+ 1-cell pad)
     pad  = 1
     rmin = max(0, int(r_idx.min()) - pad)
-    rmax = min(dem_arr.shape[0], int(r_idx.max()) + pad + 1)
+    rmax = min(fdir_arr.shape[0], int(r_idx.max()) + pad + 1)
     cmin = max(0, int(c_idx.min()) - pad)
-    cmax = min(dem_arr.shape[1], int(c_idx.max()) + pad + 1)
+    cmax = min(fdir_arr.shape[1], int(c_idx.max()) + pad + 1)
 
-    mask_clip = hru_mask[rmin:rmax, cmin:cmax]
-    fdir_clip = fdir_arr[rmin:rmax, cmin:cmax]
+    mask = hru_mask[rmin:rmax, cmin:cmax]
+    fdir = fdir_arr[rmin:rmax, cmin:cmax]
+    facc = facc_arr[rmin:rmax, cmin:cmax]
+    rl   = r_idx - rmin
+    cl   = c_idx - cmin
+    MR, MC = mask.shape
 
-    # Re-index to clipped coordinates
-    r_local = r_idx - rmin
-    c_local = c_idx - cmin
+    # ------------------------------------------------------------------
+    # 2. Find main outlet: boundary cell with highest flow accumulation
+    # ------------------------------------------------------------------
+    out_r, out_c, out_dist = None, None, None
+    max_acc = -1.0
 
-    # Sort ascending elevation (outlet cells first)
-    order    = np.argsort(elevs)
-    r_sorted = r_local[order]
-    c_sorted = c_local[order]
-
-    path_len = np.zeros(fdir_clip.shape, dtype=np.float64)
-    max_r, max_c = fdir_clip.shape
-
-    for r, c in zip(r_sorted, c_sorted):
-        d = int(fdir_clip[r, c])
-        if d not in _D8_OFFSETS:
-            path_len[r, c] = 0.0
+    for r, c in zip(rl, cl):
+        d = int(fdir[r, c])
+        if d not in D8:
             continue
+        dr, dc, dist = D8[d]
+        nr2, nc2 = r + dr, c + dc
+        exits = (nr2 < 0 or nr2 >= MR or nc2 < 0 or nc2 >= MC
+                 or not mask[nr2, nc2])
+        if exits and facc[r, c] > max_acc:
+            max_acc          = facc[r, c]
+            out_r, out_c     = r, c
+            out_dist         = dist
 
-        dr, dc, dmult = _D8_OFFSETS[d]
-        nr, nc = r + dr, c + dc
-        step   = dmult * cell_size
+    if out_r is None:
+        return np.nan
 
-        if 0 <= nr < max_r and 0 <= nc < max_c and mask_clip[nr, nc]:
-            # Downstream cell is still inside the HRU
-            path_len[r, c] = step + path_len[nr, nc]
-        else:
-            # Path exits the HRU (or hits DEM edge / sink)
-            path_len[r, c] = step
+    # ------------------------------------------------------------------
+    # 3. Compute path lengths (downstream cells first)
+    #    Sorting by descending accumulation guarantees every cell's
+    #    downstream neighbour is processed before the cell itself.
+    # ------------------------------------------------------------------
+    path_len = np.full((MR, MC), np.nan)
+    path_len[out_r, out_c] = out_dist   # outlet: one step to exit
 
-    cell_lengths = path_len[r_local, c_local]
-    return float(np.mean(cell_lengths))
+    order = np.argsort(-facc[rl, cl])   # descending accumulation
+    for r, c in zip(rl[order], cl[order]):
+        if not np.isnan(path_len[r, c]):
+            continue                     # already resolved
+        d = int(fdir[r, c])
+        if d not in D8:
+            continue
+        dr, dc, dist = D8[d]
+        nr2, nc2 = r + dr, c + dc
+        exits = (nr2 < 0 or nr2 >= MR or nc2 < 0 or nc2 >= MC
+                 or not mask[nr2, nc2])
+        if not exits and not np.isnan(path_len[nr2, nc2]):
+            path_len[r, c] = dist + path_len[nr2, nc2]
+        # cells that exit elsewhere stay NaN (don't belong to main path)
+
+    # ------------------------------------------------------------------
+    # 4. Routing length = max path to the main outlet
+    # ------------------------------------------------------------------
+    vals = path_len[rl, cl]
+    valid_vals = vals[~np.isnan(vals)]
+
+    if len(valid_vals) > 0:
+        return float(np.nanmax(valid_vals))
+
+    # Fallback: no cell reached the main outlet (complex HRU topology)
+    # → compute max path to ANY boundary exit
+    path_any = np.full((MR, MC), np.nan)
+    for r, c in zip(rl, cl):
+        d = int(fdir[r, c])
+        if d not in D8:
+            path_any[r, c] = 0.0
+            continue
+        dr, dc, dist = D8[d]
+        nr2, nc2 = r + dr, c + dc
+        exits = (nr2 < 0 or nr2 >= MR or nc2 < 0 or nc2 >= MC
+                 or not mask[nr2, nc2])
+        if exits:
+            path_any[r, c] = dist
+
+    for r, c in zip(rl[order], cl[order]):
+        if not np.isnan(path_any[r, c]):
+            continue
+        d = int(fdir[r, c])
+        if d not in D8:
+            continue
+        dr, dc, dist = D8[d]
+        nr2, nc2 = r + dr, c + dc
+        if (0 <= nr2 < MR and 0 <= nc2 < MC
+                and mask[nr2, nc2]
+                and not np.isnan(path_any[nr2, nc2])):
+            path_any[r, c] = dist + path_any[nr2, nc2]
+
+    fallback = path_any[rl, cl]
+    fallback = fallback[~np.isnan(fallback)]
+    return float(np.nanmax(fallback)) if len(fallback) > 0 else np.nan
 
 
-# ---- Process every polygon --------------------------------------------------
-print(f"\n[4/5] Computing routing lengths for {len(hru_gdf)} HRU polygons ...")
-
+# ── Process every HRU polygon ─────────────────────────────────────────────────
 records = []
 
-for i, (feat_idx, row) in enumerate(hru_gdf.iterrows()):
+for i, (_, row) in enumerate(hru_gdf.iterrows()):
     hru_id = row[HRU_ID_FIELD]
     geom   = row.geometry
 
     if geom is None or geom.is_empty:
-        print(f"  [{i+1:>4d}/{len(hru_gdf)}] HRU {hru_id}: empty geometry — skipped.")
+        print(f"  [{i+1:>3}/{n_polys}] HRU {hru_id}: empty geometry — skipped")
         continue
 
-    # --- Polygon area in m² ---
+    # Area in m²
     if dem_crs.is_geographic:
         try:
-            utm_crs = gpd.GeoSeries([geom], crs=hru_gdf.crs).estimate_utm_crs()
+            utm     = gpd.GeoSeries([geom], crs=hru_gdf.crs).estimate_utm_crs()
             area_m2 = float(
-                gpd.GeoSeries([geom], crs=hru_gdf.crs)
-                   .to_crs(utm_crs)
-                   .area.iloc[0]
+                gpd.GeoSeries([geom], crs=hru_gdf.crs).to_crs(utm).area.iloc[0]
             )
         except Exception:
-            area_m2 = None   # will be estimated from cell count below
+            area_m2 = None
     else:
         area_m2 = float(geom.area)
 
-    # --- Rasterize polygon onto DEM grid ---
+    # Rasterize HRU polygon onto the DEM grid (overlay HRU on DEM)
     hru_mask = rasterize(
         [(geom, 1)],
         out_shape=(n_rows, n_cols),
@@ -340,83 +414,68 @@ for i, (feat_idx, row) in enumerate(hru_gdf.iterrows()):
     ).astype(bool)
 
     n_cells = int(hru_mask.sum())
-
     if n_cells == 0:
-        print(f"  [{i+1:>4d}/{len(hru_gdf)}] HRU {hru_id}: no overlapping DEM cells — skipped.")
+        print(f"  [{i+1:>3}/{n_polys}] HRU {hru_id}: no DEM cells — skipped")
         continue
 
     if area_m2 is None:
-        area_m2 = n_cells * (cell_size_m ** 2)
+        area_m2 = n_cells * cell_x_m * cell_y_m
 
-    # --- Routing length ---
-    rl = _routing_length_for_hru(hru_mask, dem_full, flow_dir_full, cell_size_m)
+    rl = _routing_length(hru_mask, fdir_full, facc_full)
 
-    records.append(
-        {
-            "HRU_ID":           hru_id,
-            "routing_length_m": round(rl, 3),
-            "area_m2":          round(area_m2, 2),
-            "n_cells":          n_cells,
-        }
-    )
+    records.append({
+        "HRU_ID":           hru_id,
+        "routing_length_m": round(rl, 3) if not np.isnan(rl) else np.nan,
+        "area_m2":          round(area_m2, 2),
+        "n_cells":          n_cells,
+    })
 
-    if (i + 1) % 20 == 0 or (i + 1) == len(hru_gdf):
-        print(
-            f"  [{i+1:>4d}/{len(hru_gdf)}] HRU {hru_id:>8} | "
-            f"routing_length = {rl:>9.2f} m | area = {area_m2:>14,.1f} m²"
-        )
+    print(f"  [{i+1:>3}/{n_polys}] HRU {str(hru_id):>4} | "
+          f"routing_length = {rl:>9.2f} m | "
+          f"area = {area_m2:>14,.1f} m²")
 
-print(f"\n      Valid polygons processed : {len(records)}")
+print(f"\n      Valid polygons: {len(records)}")
 
 
-# -----------------------------------------------------------------------------
-# SECTION 7 — AGGREGATE DUPLICATE HRU IDs (AREA-WEIGHTED AVERAGE)
-# -----------------------------------------------------------------------------
-print("\n[5/5] Aggregating duplicate HRU IDs ...")
+# =============================================================================
+# STEP 6 — AGGREGATE DUPLICATE HRU IDs (AREA-WEIGHTED)
+# =============================================================================
+print("\n[6/6] Aggregating duplicate HRU IDs ...")
 
 df_raw = pd.DataFrame(records)
-
-dup_ids = df_raw[df_raw.duplicated("HRU_ID", keep=False)]["HRU_ID"].nunique()
-if dup_ids:
-    print(f"      Found {dup_ids} HRU ID(s) present in more than one polygon.")
-    print("      Applying area-weighted average for routing length.")
+dup    = df_raw[df_raw.duplicated("HRU_ID", keep=False)]["HRU_ID"].nunique()
+if dup:
+    print(f"      {dup} duplicate HRU ID(s) → area-weighted average")
 else:
-    print("      No duplicate HRU IDs — no aggregation needed.")
+    print("      No duplicate HRU IDs.")
 
 
-def _weighted_mean_group(group: pd.DataFrame) -> pd.Series:
-    w = group["area_m2"]
-    v = group["routing_length_m"]
+def _agg(group):
+    w   = group["area_m2"]
+    v   = group["routing_length_m"]
     wav = float(np.average(v, weights=w)) if w.sum() > 0 else float(v.mean())
-    return pd.Series(
-        {
-            "routing_length_m": round(wav, 3),
-            "total_area_m2":    round(w.sum(), 2),
-            "n_polygons":       len(group),
-            "total_cells":      int(group["n_cells"].sum()),
-        }
-    )
+    return pd.Series({
+        "routing_length_m": round(wav, 3),
+        "total_area_m2":    round(w.sum(), 2),
+        "n_polygons":       len(group),
+        "total_cells":      int(group["n_cells"].sum()),
+    })
 
 
 try:
-    df_out = (df_raw.groupby("HRU_ID", sort=False)
-              .apply(_weighted_mean_group, include_groups=False)
+    df_out = (df_raw.groupby("HRU_ID", sort=True)
+              .apply(_agg, include_groups=False)
               .reset_index())
 except TypeError:
-    # pandas < 2.2 does not have include_groups
-    df_out = (df_raw.groupby("HRU_ID", sort=False)
-              .apply(_weighted_mean_group)
+    df_out = (df_raw.groupby("HRU_ID", sort=True)
+              .apply(_agg)
               .reset_index())
 
-
-# -----------------------------------------------------------------------------
-# SECTION 8 — SAVE OUTPUT
-# -----------------------------------------------------------------------------
 df_out.to_csv(OUTPUT_CSV, index=False)
 
 print(f"\n{'='*60}")
-print(f"  Output saved  : {OUTPUT_CSV}")
-print(f"  Total HRUs    : {len(df_out)}")
+print(f"  Output : {OUTPUT_CSV}")
+print(f"  HRUs   : {len(df_out)}")
 print(f"{'='*60}")
-print("\nSample results:")
+print("\nFinal results:")
 print(df_out.to_string(index=False))

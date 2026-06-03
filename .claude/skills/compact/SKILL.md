@@ -1,9 +1,9 @@
 ---
-name: compact
+name: conversation-compactor
 description: Exhaustively summarize the entire conversation without losing any detail — every decision, file change, error, fix, question, and answer.
 ---
 
-# Compact: Full-Detail Conversation Summary
+# Conversation Compactor: Full-Detail Conversation Summary
 
 Produce a complete, lossless summary of the entire conversation so far. The goal is to preserve every meaningful detail so that the session can continue seamlessly with full context intact.
 
